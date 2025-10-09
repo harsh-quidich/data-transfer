@@ -1,0 +1,26 @@
+{
+    "camera01": {
+        "src": "/mnt/EyeQ_disk1/ring_buffer_jpg/data_transfer_test/camera01",
+        "dest_base": "/mnt/bt3-disk-01/data_transfer_test/"
+    }
+    ,"camera02": {
+        "src": "/mnt/EyeQ_disk1/ring_buffer_jpg/data_transfer_test/camera02",
+        "dest_base": "/mnt/bt3-disk-02/data_transfer_test/"
+    }
+    ,"camera03": {
+        "src": "/mnt/EyeQ_disk1/ring_buffer_jpg/data_transfer_test/camera03",
+        "dest_base": "/mnt/bt3-disk-03/data_transfer_test/"
+    }
+    ,"camera04": {
+        "src": "/mnt/EyeQ_disk1/ring_buffer_jpg/data_transfer_test/camera04",
+        "dest_base": "/mnt/bt3-disk-01/data_transfer_test/"
+    }
+    ,"camera05": {
+        "src": "/mnt/EyeQ_disk1/ring_buffer_jpg/data_transfer_test/camera05",
+        "dest_base": "/mnt/bt3-disk-02/data_transfer_test/"
+    }
+    ,"camera06": {
+        "src": "/mnt/EyeQ_disk1/ring_buffer_jpg/data_transfer_test/camera06",
+        "dest_base": "/mnt/bt3-disk-03/data_transfer_test/"
+    }
+  }

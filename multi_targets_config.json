@@ -1,0 +1,36 @@
+{
+  "targets": [
+    {
+      "ip": "192.168.5.101",
+      "port": 5555,
+      "name": "server1"
+    },
+    {
+      "ip": "192.168.5.102", 
+      "port": 5555,
+      "name": "server2"
+    },
+    {
+      "ip": "192.168.5.103",
+      "port": 5555,
+      "name": "server3"
+    },
+    {
+      "ip": "localhost",
+      "port": 5555,
+      "name": "local_server"
+    }
+  ],
+  "default_message": {
+    "frame_id": "frame_camera01_000000001.jpg",
+    "ball_id": "BPL_270625_1_1st_0_5",
+    "isStopped": false,
+    "diskpaths": []
+  },
+  "settings": {
+    "timeout_ms": 5000,
+    "use_async": false,
+    "repeat_count": 1,
+    "interval_seconds": 1.0
+  }
+}
