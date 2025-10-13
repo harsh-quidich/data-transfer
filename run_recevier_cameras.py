@@ -164,6 +164,7 @@ def main() -> int:
                 "--workers", str(workers),
                 "--reuseport",
                 "--verbose",
+                "--use-dest-paths"
             ]
             print(f"Starting {camera_name} on {listen_ip}:{port} -> {out_dir}")
             print("  ", " ".join(cmd))

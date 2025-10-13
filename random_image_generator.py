@@ -21,8 +21,8 @@ import numpy as np
 from PIL import Image
 
 # ---------- CONFIG ----------
-camera_name = "camera03"
-OUT_DIR = f"/mnt/EyeQ_disk1/ring_buffer_jpg/data_transfer_test/{camera_name}"
+camera_names = ["camera01", "camera02", "camera03", "camera04", "camera05", "camera06"]
+OUT_DIR = f"/mnt/EyeQ_disk1/ring_buffer_jpg/data_transfer_test/"
 COUNT = 900                     # number of images to generate
 MIN_MB = 1.0                    # minimum file size (MiB)
 MAX_MB = 2.0                    # maximum file size (MiB)
@@ -147,25 +147,29 @@ def ensure_out_dir(out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
 
 def main():
-    out_dir = Path(OUT_DIR)
-    ensure_out_dir(out_dir)
-    print(f"Generating {COUNT} images into '{out_dir.resolve()}' each between {MIN_MB} MiB and {MAX_MB} MiB ...")
-    successes = 0
-    failures = 0
 
-    for i in range(1, COUNT + 1):
-        fname = f"frame_{camera_name}_{i:09d}.jpg"
-        path = out_dir / fname
-        ok = generate_one_image(path, MIN_BYTES, MAX_BYTES, BASE_WIDTH, BASE_HEIGHT)
-        if ok:
-            size = path.stat().st_size
-            print(f"[{i:03d}/{COUNT}] Wrote {fname} — {size / (1024*1024):.3f} MiB")
-            successes += 1
-        else:
-            print(f"[{i:03d}/{COUNT}] FAILED to generate {fname}")
-            failures += 1
+    for camera_name in camera_names:
+        print(OUT_DIR)
+        out_dir = os.path.join(Path(OUT_DIR), camera_name)
+        out_dir = Path(out_dir)
+        ensure_out_dir(out_dir)
+        print(f"Generating {COUNT} images into '{out_dir.resolve()}' each between {MIN_MB} MiB and {MAX_MB} MiB ...")
+        successes = 0
+        failures = 0
 
-    print(f"Done. successes={successes}, failures={failures}")
+        for i in range(1, COUNT + 1):
+            fname = f"frame_{camera_name}_{i:09d}.jpg"
+            path = out_dir / fname
+            ok = generate_one_image(path, MIN_BYTES, MAX_BYTES, BASE_WIDTH, BASE_HEIGHT)
+            if ok:
+                size = path.stat().st_size
+                print(f"[{i:03d}/{COUNT}] Wrote {fname} — {size / (1024*1024):.3f} MiB")
+                successes += 1
+            else:
+                print(f"[{i:03d}/{COUNT}] FAILED to generate {fname}")
+                failures += 1
+
+        print(f"Done. successes={successes}, failures={failures}")
 
 if __name__ == "__main__":
     main()
