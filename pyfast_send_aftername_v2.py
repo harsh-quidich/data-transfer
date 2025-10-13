@@ -45,22 +45,13 @@ def cleanup_stale_part_files(src_dir: str, pattern: str, max_age_seconds: int = 
     Returns the number of files cleaned up.
     """
     import glob
-    import fnmatch
     
     cleaned_count = 0
     current_time = time.time()
     
     try:
         # Find all .part files in the source directory
-        # Look for files that match the pattern but end with .part
-        base_pattern = pattern.replace('*', '')
-        if base_pattern.endswith('.'):
-            # Pattern like "*.jpg" -> look for "*.jpg.part"
-            part_pattern = pattern + '.part'
-        else:
-            # Pattern like "*" -> look for "*.part"
-            part_pattern = pattern + '.part'
-        
+        part_pattern = pattern + '.part'
         part_files = glob.glob(os.path.join(src_dir, part_pattern))
         
         if verbose and part_files:
@@ -75,8 +66,6 @@ def cleanup_stale_part_files(src_dir: str, pattern: str, max_age_seconds: int = 
                         print(f"[cleanup] Removing stale .part file: {os.path.basename(part_file)} (age: {file_age:.1f}s)")
                     os.remove(part_file)
                     cleaned_count += 1
-                elif verbose:
-                    print(f"[cleanup] Keeping .part file: {os.path.basename(part_file)} (age: {file_age:.1f}s)")
             except (OSError, FileNotFoundError):
                 # File might have been removed by another process
                 pass
@@ -86,19 +75,33 @@ def cleanup_stale_part_files(src_dir: str, pattern: str, max_age_seconds: int = 
     
     return cleaned_count
 
-def is_complete(path: str, wait_ms: int = 5, passes: int = 1, max_wait_seconds: int = 30) -> bool:
+def wait_for_file_and_check_complete(path: str, wait_ms: int = 5, passes: int = 1, max_wait_seconds: int = 30, file_wait_ms: int = 10) -> bool:
     """
-    Return True if file size is stable for 'passes' consecutive checks spaced wait_ms apart.
-    Added timeout to prevent infinite loops waiting for incomplete files.
+    Wait for file to exist, then return True if file size is stable for 'passes' consecutive checks.
+    
+    Args:
+        path: File path to check
+        wait_ms: Milliseconds between size checks
+        passes: Consecutive stable checks required
+        max_wait_seconds: Maximum time to wait for file completion
+        file_wait_ms: Milliseconds to wait when file doesn't exist yet
     """
+    start_time = time.time()
+    max_wait_time = max_wait_seconds
+    
+    # First, wait for file to exist
+    while not os.path.exists(path):
+        if time.time() - start_time > max_wait_time:
+            return False
+        time.sleep(max(0, file_wait_ms) / 1000.0)
+    
+    # Now check if file is complete (size stable)
     try:
         last = os.path.getsize(path)
     except FileNotFoundError:
         return False
     
     stable = 0
-    start_time = time.time()
-    max_wait_time = max_wait_seconds
     
     while stable < passes:
         # Check if we've exceeded the maximum wait time
@@ -332,6 +335,7 @@ def main():
     ap.add_argument("--stable-ms", type=int, default=5, help="Milliseconds between size checks (used if lookahead not satisfied)")
     ap.add_argument("--stable-passes", type=int, default=1, help="Consecutive stable checks required (>=1)")
     ap.add_argument("--max-wait-seconds", type=int, default=1, help="Maximum seconds to wait for file completion before giving up (prevents infinite loops)")
+    ap.add_argument("--file-wait-ms", type=int, default=10, help="Milliseconds to wait when file doesn't exist yet")
     ap.add_argument("--cleanup-part-files", action="store_true", help="Clean up stale .part files on startup and periodically during tail phase")
     ap.add_argument("--part-file-max-age", type=int, default=1, help="Maximum age in seconds for .part files before cleanup (default: 1s)")
     ap.add_argument("--cleanup-interval", type=int, default=10, help="Interval in seconds for periodic .part file cleanup during tail phase (0 = disabled)")
@@ -340,7 +344,6 @@ def main():
     # stop/behavior
     ap.add_argument("--max-files", type=int, default=0, help="Stop after sending this many files (0 = unlimited)")
     ap.add_argument("--once", action="store_true", help="Send current backlog and exit (no tail)")
-    ap.add_argument("--send-count-first", action="store_true", help="Send a 64-bit file-count header once per connection before files (requires single connection and once/backlog mode)")
 
     # path handling
     ap.add_argument("--dest-path", default="", help="Destination path prefix for files on receiver (empty = use filename only)")
@@ -366,7 +369,7 @@ def main():
         print(f"[send] src={args.src_dir} host={args.host}:{args.port} conns={args.conns} pattern={args.pattern}")
         print(f"[send] start-after='{args.start_after}', max_files={args.max_files or '∞'}, once={args.once}")
         print(f"[send] lookahead={args.lookahead}, stable_ms={args.stable_ms}, stable_passes={args.stable_passes}")
-        print(f"[send] max_wait_seconds={args.max_wait_seconds}, cleanup_part_files={args.cleanup_part_files}, cleanup_interval={args.cleanup_interval}s")
+        print(f"[send] max_wait_seconds={args.max_wait_seconds}, file_wait_ms={args.file_wait_ms}, cleanup_part_files={args.cleanup_part_files}, cleanup_interval={args.cleanup_interval}s")
         if args.dest_path:
             print(f"[send] dest_path='{args.dest_path}', preserve_structure={args.preserve_structure}")
 
@@ -397,78 +400,15 @@ def main():
             if args.lookahead > 0 and lookahead_exists(args.src_dir, name, args.lookahead):
                 fast_ok = True
             if not fast_ok:
-                while not (os.path.exists(full) and is_complete(full, args.stable_ms, args.stable_passes, args.max_wait_seconds)):
-                    time.sleep(max(0, args.stable_ms) / 1000.0)
+                if not wait_for_file_and_check_complete(full, args.stable_ms, args.stable_passes, args.max_wait_seconds, args.file_wait_ms):
+                    if args.verbose:
+                        print(f"[WARNING] File {name} not ready, skipping")
+                    continue
             dest_path = generate_dest_path(args.src_dir, name, args.dest_path, args.preserve_structure)
-            if args.send_count_first:
-                names_to_send.append((full, name, dest_path))
-            else:
-                q.put((full, name, dest_path))
+            q.put((full, name, dest_path))
             enqueued_files += 1
             last_name = name
 
-    # If sending count first, we require a single connection and backlog-only (no tail)
-    if args.send_count_first:
-        if args.conns != 1:
-            print("[send] --send-count-first requires --conns=1", file=sys.stderr)
-            # Drain workers if any started
-            for _ in threads: q.put(None)
-            for t in threads: t.join()
-            return
-        # Establish single connection and send count header then stream files sequentially
-        dest = (args.host, args.port)
-        if args.verbose: print(f"[send] connecting single socket for counted session {dest}")
-        sock = socket.create_connection(dest, timeout=5)
-        sock.settimeout(None)
-        errors = []
-        try:
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
-            # Send 64-bit count first
-            total_files = len(names_to_send)
-            sock.sendall(struct.pack("!Q", total_files))
-            if args.verbose: print(f"[send] announced file-count={total_files}")
-            # Reuse send_file on the same socket
-            for full, rel_name, dest_path in names_to_send:
-                try:
-                    send_file(sock, full, rel_name, dest_path, args.verbose, counters)
-                except Exception as e:
-                    error_msg = f"Failed to send {rel_name}: {e}"
-                    errors.append((rel_name, error_msg))
-                    if args.verbose: print(f"[ERROR] {error_msg}", file=sys.stderr)
-        finally:
-            try:
-                sock.close()
-            except Exception:
-                pass
-        # Skip tail and worker queueing in this mode
-        threads = []
-        q = None
-        # Stats and exit
-        t1 = time.time()
-        elapsed = max(1e-9, t1 - t0)
-        mb = counters["bytes"] / (1024*1024)
-        mbps = mb / elapsed
-        fps = counters["files"] / elapsed
-        
-        # Report errors
-        if errors:
-            print(f"[ERROR] {len(errors)} files failed to transfer:", file=sys.stderr)
-            for rel_name, error_msg in errors:
-                print(f"[ERROR] {rel_name}: {error_msg}", file=sys.stderr)
-            if args.json_stats:
-                print(json.dumps({"files": counters["files"], "bytes": counters["bytes"], "elapsed_s": elapsed, "MiB": mb, "MiB_per_s": mbps, "files_per_s": fps, "errors": len(errors), "error_files": [name for name, _ in errors]}))
-            else:
-                print(f"[stats] files={counters['files']} bytes={counters['bytes']} elapsed={elapsed:.3f}s MiB={mb:.2f} rate={mbps:.2f} MiB/s  files/s={fps:.1f} errors={len(errors)}")
-            sys.exit(1)  # Exit with error code if any files failed
-        else:
-            if args.json_stats:
-                print(json.dumps({"files": counters["files"], "bytes": counters["bytes"], "elapsed_s": elapsed, "MiB": mb, "MiB_per_s": mbps, "files_per_s": fps}))
-            else:
-                print(f"[stats] files={counters['files']} bytes={counters['bytes']} elapsed={elapsed:.3f}s MiB={mb:.2f} rate={mbps:.2f} MiB/s  files/s={fps:.1f}")
-        return
 
     # If only backlog is needed, drain and exit
     if args.once or (args.max_files and enqueued_files >= args.max_files):
@@ -489,8 +429,10 @@ def main():
                     if args.lookahead > 0 and lookahead_exists(args.src_dir, name, args.lookahead):
                         fast_ok = True
                     if not fast_ok:
-                        while not (os.path.exists(full) and is_complete(full, args.stable_ms, args.stable_passes, args.max_wait_seconds)):
-                            time.sleep(max(0, args.stable_ms) / 1000.0)
+                        if not wait_for_file_and_check_complete(full, args.stable_ms, args.stable_passes, args.max_wait_seconds, args.file_wait_ms):
+                            if args.verbose:
+                                print(f"[WARNING] File {name} not ready, skipping")
+                            continue
                     if not args.max_files or enqueued_files < args.max_files:
                         dest_path = generate_dest_path(args.src_dir, name, args.dest_path, args.preserve_structure)
                         q.put((full, name, dest_path))

@@ -21,11 +21,18 @@ A sophisticated file transfer client that sends files over TCP with intelligent 
 
 #### Key Features:
 - **File Completion Detection**: Uses lookahead checking and file stability verification to ensure files are complete before transfer
+- **File Existence Waiting**: Waits for files to appear before checking completion, preventing race conditions
 - **Parallel Transfers**: Multi-threaded sending with configurable connection count
 - **Smart Polling**: Efficient directory scanning with configurable intervals
 - **Partial File Cleanup**: Automatic cleanup of stale `.part` files
 - **Destination Path Control**: Flexible destination path specification with structure preservation
 - **Robust Error Handling**: Retry logic and comprehensive error reporting
+
+#### Recent Improvements (v2):
+- **Enhanced File Waiting**: New `--file-wait-ms` parameter allows configurable waiting when files don't exist yet
+- **Simplified Codebase**: Removed complex `--send-count-first` functionality for cleaner, more maintainable code
+- **Better Race Condition Handling**: Improved logic prevents skipping files that are still being written
+- **Streamlined Cleanup**: Simplified `.part` file cleanup logic for better performance
 
 #### Usage:
 ```bash
@@ -37,6 +44,7 @@ python pyfast_send_aftername_v2.py \
     --pattern "*.jpg" \
     --conns 8 \
     --lookahead 4 \
+    --file-wait-ms 10 \
     --max-files 799 \
     --dest-path "/mnt/destination/" \
     --preserve-structure \
@@ -50,6 +58,7 @@ python pyfast_send_aftername_v2.py \
 - `--conns`: Number of parallel connections (default: 8)
 - `--lookahead`: Check if file+N exists to determine completion (default: 4)
 - `--stable-ms`: Milliseconds between size stability checks (default: 5)
+- `--file-wait-ms`: Milliseconds to wait when file doesn't exist yet (default: 10)
 - `--max-files`: Maximum files to send (0 = unlimited)
 - `--dest-path`: Destination path prefix
 - `--preserve-structure`: Maintain directory structure in destination
@@ -266,6 +275,7 @@ python3 clear_destination.py --all [--config /path/config.json] [--yes]
 
 ### Sender Side Architecture:
 - **File Discovery**: Polling-based detection with completion verification
+- **File Waiting**: Intelligent waiting for files to appear before processing
 - **Parallel Transfer**: Multi-threaded sending with configurable connections
 - **Protocol Support**: TCP with custom framing for filenames and destination paths
 - **Error Handling**: Retry logic and comprehensive error reporting
@@ -278,6 +288,7 @@ python3 clear_destination.py --all [--config /path/config.json] [--yes]
 
 ### Key Design Principles:
 - **File Completion Detection**: Ensures files are fully written before transfer
+- **File Existence Handling**: Waits for files to appear, preventing race conditions
 - **Parallel Processing**: Multiple connections for high throughput
 - **Fault Tolerance**: Retry logic and error handling
 - **Flexible Routing**: Configurable destination paths with structure preservation
@@ -365,6 +376,7 @@ echo '{"frame_id": "frame_camera01_000046836.jpg", "ball_id": "ball_001"}' | nc 
 ### Sender Side:
 - **Connection Count**: Default 8 connections provides good balance of throughput and resource usage
 - **Lookahead**: Setting to 4 provides fast completion detection for sequential files
+- **File Wait Time**: 10ms default wait time for files to appear balances responsiveness and efficiency
 - **Chunk Size**: 8 MiB chunks optimize network transfer efficiency
 - **Polling Interval**: 50ms default provides responsive file detection without excessive CPU usage
 
@@ -379,6 +391,7 @@ echo '{"frame_id": "frame_camera01_000046836.jpg", "ball_id": "ball_001"}' | nc 
 ### Sender Side:
 - Network connection retries with exponential backoff
 - File system error recovery and completion detection
+- File existence waiting with configurable timeouts
 - Process timeout management
 - Detailed error reporting with JSON output option
 - Graceful shutdown on interruption
