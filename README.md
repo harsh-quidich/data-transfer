@@ -99,14 +99,14 @@ pip install pillow numpy
 ```
 
 ### 3. `run_senders_from_config.py`
-**Multi-camera sender launcher with ZMQ trigger support**
+**Multi-camera sender launcher with ZMQ PUB/SUB trigger support**
 
-Orchestrates multiple file senders based on camera configuration. Supports both direct execution and ZMQ-triggered operation for integration with external systems.
+Orchestrates multiple file senders based on camera configuration. Supports both direct execution and ZMQ PUB/SUB-triggered operation for integration with external systems.
 
 #### Features:
 - **Configuration-Driven**: Uses `camera_config.json` to define camera sources and destinations
 - **Parallel Launch**: Starts multiple senders concurrently on different ports
-- **ZMQ Integration**: Optional ZMQ REP server for external triggering
+- **ZMQ Integration**: ZMQ SUB subscriber for external triggering, with optional PUB forwarder to fan-out triggers to other machines
 - **Ball ID Support**: Dynamic destination path construction based on ball/camera IDs
 - **Timeout Management**: Configurable timeouts for sender processes
 - **Detached Mode**: Option to run senders in background
@@ -118,27 +118,80 @@ Orchestrates multiple file senders based on camera configuration. Supports both 
 python run_senders_from_config.py
 ```
 
-**ZMQ trigger mode:**
+**ZMQ PUB/SUB trigger mode (subscriber):**
 We are going to use this at the deployment
 ```bash
-python run_senders_from_config.py --zmq --zmq-port 5555
+python run_senders_from_config.py \
+    --zmq-sub \
+    --zmq-sub-endpoint tcp://192.168.5.100:5876 \
+    --zmq-sub-topic ""
 ```
+
+**ZMQ subscriber with forwarding to others (forwarder PUB):**
+```bash
+python run_senders_from_config.py \
+    --zmq-sub \
+    --zmq-sub-endpoint tcp://localhost:5876 \
+    --zmq-sub-topic "" \
+    --forward-pub \
+    --forward-bind "tcp://0.0.0.0:5811" \
+    --forward-topic ""
+```
+Run other machines as pure subscribers to the forwarder's PUB endpoint:
+```bash
+python run_senders_from_config.py \
+    --zmq-sub \
+    --zmq-sub-endpoint tcp://192.168.5.100:5811 \
+    --zmq-sub-topic ""
+```
+
+#### ZMQ forwarder/subscriber setup and precautions
+
+When you forward triggers from one machine to others using PUB/SUB, follow this pattern:
+
+- Forwarder machine (binds PUB on its own IP):
+```bash
+python run_senders_from_config.py \
+    --zmq-sub \
+    --zmq-sub-endpoint tcp://localhost:5876 \
+    --zmq-sub-topic "" \
+    --forward-pub \
+    --forward-bind "tcp://192.168.5.102:5877" \
+    --forward-topic ""
+```
+
+- Remote subscriber machine(s) (connect to the forwarder):
+```bash
+python run_senders_from_config.py \
+    --zmq-sub \
+    --zmq-sub-endpoint tcp://192.168.5.102:5877 \
+    --zmq-sub-topic ""
+```
+
+Precautions and common pitfalls:
+- IP must belong to the host that binds: Only bind to an address on the local machine or use `tcp://0.0.0.0:<port>` to listen on all interfaces. Binding to a non-local IP will fail with "Cannot assign requested address".
+- Verify local IP: `hostname -I` or `ip -4 addr show` and pick the exact NIC IP (e.g., `192.168.5.102`).
+- Check port availability: `ss -ltnp | grep :5877` should return nothing before you bind; change the port if in use.
+- Firewalls and routing: Ensure inbound access to the chosen port from remote machines (open the port in firewall/security groups; confirm the machines are on reachable subnets/VLANs).
+- Topics: If you set `--forward-topic ""`, subscribers should use `--zmq-sub-topic ""` to receive all messages. If you set a non-empty topic, subscribers must set the exact same topic string.
+- Slow joiner syndrome: Give subscribers a brief time to connect before sending messages. The script already sleeps ~200ms after subscribing; when orchestrating externally, wait a moment after starting subscribers.
+- Bind vs connect: Forwarder uses `bind` on the PUB socket; subscribers always `connect` to that address.
+- Using 0.0.0.0: `--forward-bind tcp://0.0.0.0:<port>` is convenient to listen on all interfaces, but always document which concrete IP remote subscribers should use.
 
 **Detached mode:**
 ```bash
 python run_senders_from_config.py --detach
 ```
 
-#### ZMQ Protocol:
-When using `--zmq`, the script listens for JSON messages:
+#### ZMQ Protocol (PUB/SUB):
+When using `--zmq-sub`, the script subscribes to JSON messages (either single-part JSON or multipart `[topic, json]`):
 ```json
 {
     "frame_id": "frame_camera01_000046836.jpg",
-    "ball_id": "ball_001"
+    "ball_id": "BPL_270625_1_1st_6_6"
 }
 ```
-
-The script extracts the frame number and ball ID to construct appropriate start-after parameters and destination paths.
+The script extracts the frame number and ball ID to construct appropriate start-after parameters and destination paths. Messages with `isStopped: true` are ignored.
 
 ### 4. `camera_config.json`
 **Camera configuration file**

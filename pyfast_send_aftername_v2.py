@@ -187,6 +187,19 @@ def send_file(sock, src_path, rel_name, dest_path, verbose, counters):
                 # Try sendfile first (most efficient)
                 sent = sock.sendfile(f, offset=offset, count=to_send)
                 
+                if offset != size:
+                    raise ConnectionError(f"Incomplete transfer of {rel_name}: sent {offset}/{size} bytes")
+
+                # Read ACK with timeout to avoid hanging forever
+                prev = sock.gettimeout()
+                try:
+                    sock.settimeout(5.0)  # tune as needed
+                    ack = sock.recv(1)
+                finally:
+                    sock.settimeout(prev)
+                if not ack:
+                    raise ConnectionError("receiver closed without ACK")
+                
                 if sent is None:
                     # Some platforms return None; fall back to manual send
                     if verbose: print(f"[send] sendfile returned None, falling back to manual send for {rel_name}")

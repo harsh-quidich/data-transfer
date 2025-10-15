@@ -41,9 +41,15 @@ def construct_dest_path(camera_dest_path: str, ball_id: str, camera_name: str) -
 def main() -> int:
     ap = argparse.ArgumentParser(description="Launch multiple senders from camera_config.json")
     ap.add_argument("--detach", action="store_true", help="Start senders in background and exit immediately")
-    ap.add_argument("--timeout-secs", type=float, default=10.0, help="For threaded (non-detach) mode: max seconds to run before stopping (0 = no timeout)")
-    ap.add_argument("--zmq", action="store_true", help="Run a ZMQ REP server to trigger senders from incoming frame_id payloads")
-    ap.add_argument("--zmq-port", type=int, default=5555, help="ZMQ REP port for trigger mode (avoid 5555 used elsewhere)")
+    ap.add_argument("--timeout-secs", type=float, default=0.0, help="For threaded (non-detach) mode: max seconds to run before stopping (0 = no timeout)")
+    # PUB/SUB mode only
+    ap.add_argument("--zmq-sub", action="store_true", help="Run a ZMQ SUB client to trigger senders from published payloads")
+    ap.add_argument("--zmq-sub-endpoint", type=str, default="tcp://127.0.0.1:5876", help="ZMQ SUB endpoint to connect to (e.g., tcp://<host>:<port>)")
+    ap.add_argument("--zmq-sub-topic", type=str, default="", help="Optional topic to subscribe to (empty subscribes to all)")
+    # Forwarding (PUB) options
+    ap.add_argument("--forward-pub", action="store_true", help="Enable forwarding of received triggers to other machines via PUB")
+    ap.add_argument("--forward-bind", type=str, default="tcp://*:5876", help="PUB bind endpoint used to forward triggers (e.g., tcp://*:5876)")
+    ap.add_argument("--forward-topic", type=str, default="", help="Optional PUB topic when forwarding (empty sends raw JSON only)")
     args = ap.parse_args()
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, "camera_config.json")
@@ -61,13 +67,13 @@ def main() -> int:
 
     # Fixed parameters per user example
     host = "192.168.5.101"
-    base_port = 50004
+    base_port = 50001
     pattern = "*.jpg"
     conns = 8
     lookahead = 4
     stable_ms = 1
     stable_passes = 1
-    max_files = 799
+    max_files = 899
 
     def launch_senders_with_suffix(start_after_suffix: str, ball_id: str = "") -> int:
         # Launch one sender per camera concurrently on distinct ports
@@ -194,52 +200,83 @@ def main() -> int:
 
         return 0
 
-    if args.zmq:
+    if args.zmq_sub:
         context = zmq.Context()
-        socket = context.socket(zmq.REP)
-        bind_addr = f"tcp://*:{args.zmq_port}"
-        socket.bind(bind_addr)
-        print(f"[zmq] Listening for triggers on {bind_addr}")
-        print("[zmq] Expected JSON with 'frame_id' like 'frame_camera01_000046836.jpg' (other fields ignored)")
+        socket = context.socket(zmq.SUB)
+        connect_addr = args.zmq_sub_endpoint
+        socket.connect(connect_addr)
+        # Topic subscription (empty string subscribes to all)
+        topic = args.zmq_sub_topic.encode("utf-8") if isinstance(args.zmq_sub_topic, str) else args.zmq_sub_topic
+        socket.setsockopt(zmq.SUBSCRIBE, topic)
+        print(f"[zmq-sub] Subscribed to '{args.zmq_sub_topic}' on {connect_addr}")
+        # Allow time for subscription to propagate
+        time.sleep(0.2)
+        print("[zmq-sub] Waiting for published messages (JSON with frame_id, ball_id)...")
+        # Optional forwarder PUB socket
+        pub_socket = None
+        if args.forward_pub:
+            pub_socket = context.socket(zmq.PUB)
+            pub_socket.bind(args.forward_bind)
+            print(f"[forward] PUB bound on {args.forward_bind} (topic='{args.forward_topic}')")
         try:
             while True:
                 try:
-                    msg = socket.recv_string()
-                    print(f"[zmq] received: {msg}")
+                    # Support both single-part (raw JSON) and multipart ([topic, json]) publishers
+                    parts = socket.recv_multipart()
+                    if len(parts) == 1:
+                        payload_bytes = parts[0]
+                        topic_str = None
+                    else:
+                        topic_str = parts[0].decode("utf-8", errors="ignore")
+                        payload_bytes = parts[-1]
                     try:
-                        data = json.loads(msg)
-                    except json.JSONDecodeError as e:
-                        socket.send_string(f"ERROR: invalid JSON: {e}")
+                        msg_str = payload_bytes.decode("utf-8")
+                        data = json.loads(msg_str)
+                    except Exception as e:
+                        print(f"[zmq-sub] invalid message: {e}")
                         continue
-                    if "frame_id" not in data:
-                        socket.send_string("ERROR: missing 'frame_id'")
+                    print(f"[zmq-sub] received{f' topic={topic_str}' if topic_str else ''}: {data}")
+                    # Ignore if capture is stopped
+                    if isinstance(data, dict) and data.get("isStopped") is True:
+                        print("[zmq-sub] IGNORED: isStopped True; no action taken")
                         continue
-                    frame_id = data["frame_id"]
-                    ball_id = data["ball_id"]
+                    if not isinstance(data, dict) or "frame_id" not in data:
+                        print("[zmq-sub] ERROR: missing 'frame_id'")
+                        continue
+                    frame_id = data.get("frame_id", "")
+                    ball_id = data.get("ball_id", "default")
                     try:
                         num = parse_frame_number_from_id(frame_id)
-                        # ball_id = extract_ball_id_from_frame_id(frame_id)
                     except ValueError as e:
-                        socket.send_string(f"ERROR: {e}")
+                        print(f"[zmq-sub] ERROR: {e}")
                         continue
                     suffix = f"{num:09d}"
-                    print(f"[zmq] launching senders start-after suffix={suffix}, ball_id={ball_id}")
+                    print(f"[zmq-sub] launching senders start-after suffix={suffix}, ball_id={ball_id}")
+                    # Forward to others if enabled
+                    if pub_socket is not None:
+                        try:
+                            forward_payload = json.dumps(data)
+                            if args.forward_topic:
+                                pub_socket.send_multipart([args.forward_topic.encode("utf-8"), forward_payload.encode("utf-8")])
+                            else:
+                                pub_socket.send_string(forward_payload)
+                            print("[forward] published trigger to subscribers")
+                        except Exception as fe:
+                            print(f"[forward] publish error: {fe}")
                     rc = launch_senders_with_suffix(suffix, ball_id)
                     if rc == 0:
-                        socket.send_string(f"SUCCESS: launched with start-after={suffix}, ball_id={ball_id}")
+                        print(f"[zmq-sub] SUCCESS: launched with start-after={suffix}, ball_id={ball_id}")
                     else:
-                        socket.send_string(f"ERROR: one or more senders failed (rc={rc})")
+                        print(f"[zmq-sub] ERROR: one or more senders failed (rc={rc})")
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
-                    print(f"[zmq] error: {e}")
-                    try:
-                        socket.send_string(f"ERROR: {e}")
-                    except Exception:
-                        pass
+                    print(f"[zmq-sub] error: {e}")
         finally:
             try:
                 socket.close(0)
+                if pub_socket is not None:
+                    pub_socket.close(0)
             finally:
                 context.term()
         return 0
