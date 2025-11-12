@@ -9,9 +9,9 @@ from typing import Dict, Tuple, List
 
 
 def build_out_dir(camera_name: str, cfg: Dict[str, str]) -> str:
-    dest_base = cfg.get("dest_base")
+    dest_base = cfg.get("dest_path")
     if not dest_base:
-        raise ValueError(f"camera {camera_name} missing 'dest_base' in config")
+        raise ValueError(f"camera {camera_name} missing 'dest_path' in config")
     
     return os.path.join(dest_base, camera_name)
 
@@ -36,7 +36,7 @@ def main() -> int:
 
     listen_ip = "0.0.0.0"
     base_port = 50001
-    workers = 16
+    workers = 32
 
     processes: List[Tuple[str, int, subprocess.Popen]] = []
     

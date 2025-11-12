@@ -11,19 +11,33 @@ import re
 import zmq
 
 
-def parse_frame_number_from_id(frame_id: str) -> int:
-    m = re.match(r"frame_[^_]+_(\d{9})\.jpg$", frame_id)
-    if not m:
-        raise ValueError(f"Invalid frame_id format: {frame_id}")
-    return int(m.group(1))
+def parse_frame_info(frame_id: str) -> tuple[int, str, str, str]:
+    """
+    Parse frame_id supporting two formats and return (num, digits_str, scheme, camera_token).
+    schemes:
+      - 'camera_then_num': frame_<cameraToken>_<digits>.jpg
+      - 'num_then_camera': frame_<digits>_<cameraToken>.jpg
+    """
+    # Pattern A: frame_camera09_000000000.jpg
+    m = re.match(r"^frame_([^_]+)_(\d+)\.jpg$", frame_id)
+    if m:
+        camera_token, digits = m.group(1), m.group(2)
+        return int(digits), digits, "camera_then_num", camera_token
+    # Pattern B: frame_000000_camera01.jpg
+    m = re.match(r"^frame_(\d+)_([^_]+)\.jpg$", frame_id)
+    if m:
+        digits, camera_token = m.group(1), m.group(2)
+        return int(digits), digits, "num_then_camera", camera_token
+    raise ValueError(f"Invalid frame_id format: {frame_id}")
 
 
 def extract_ball_id_from_frame_id(frame_id: str) -> str:
-    """Extract ball_id from frame_id like 'frame_camera01_000046836.jpg' -> 'camera01'."""
-    m = re.match(r"frame_([^_]+)_\d{9}\.jpg$", frame_id)
-    if not m:
-        raise ValueError(f"Invalid frame_id format for ball_id extraction: {frame_id}")
-    return m.group(1)
+    """Extract camera token from frame_id for both supported formats."""
+    try:
+        _, _, _, camera_token = parse_frame_info(frame_id)
+        return camera_token
+    except ValueError as e:
+        raise ValueError(f"Invalid frame_id format for ball_id extraction: {frame_id}") from e
 
 
 def extract_camera_name_from_src_dir(src_dir: str) -> str:
@@ -75,7 +89,7 @@ def main() -> int:
     stable_passes = 1
     max_files = 899
 
-    def launch_senders_with_suffix(start_after_suffix: str, ball_id: str = "") -> int:
+    def launch_senders_with_suffix(start_after_suffix: str, ball_id: str = "", scheme: str = "camera_then_num", dragonfly_key: str = "", side: str = "") -> int:
         # Launch one sender per camera concurrently on distinct ports
         procs = []
         threads = []
@@ -100,8 +114,11 @@ def main() -> int:
                 print(f"Skipping {cam_name}: missing 'dest_path' in config", file=sys.stderr)
                 continue
 
-            # Derive start-after like frame_<camera>_<suffix>.jpg
-            start_after = f"frame_{cam_name}_{start_after_suffix}.jpg"
+            # Derive start-after based on incoming frame_id scheme
+            if scheme == "camera_then_num":
+                start_after = f"frame_{cam_name}_{start_after_suffix}.jpg"
+            else:  # num_then_camera
+                start_after = f"frame_{start_after_suffix}_{cam_name}.jpg"
             port = base_port + idx
 
             # Construct destination path
@@ -125,14 +142,23 @@ def main() -> int:
                 "--stable-passes", str(stable_passes),
                 "--max-files", str(max_files),
                 "--once",
-                "--verbose",
                 "--cleanup-part-files",
             ]
             
             # Add destination path (always provided from config)
             print(f"[DEST] {cam_name}: Frames will be copied to: {dest_path}/<filename>")
-            print(f"[DEST] Example: {dest_path}/frame_{cam_name}_{start_after_suffix}.jpg")
+            example_name = (
+                f"frame_{cam_name}_{start_after_suffix}.jpg" if scheme == "camera_then_num" else f"frame_{start_after_suffix}_{cam_name}.jpg"
+            )
+            print(f"[DEST] Example: {dest_path}/{example_name}")
             cmd.extend(["--dest-path", dest_path])
+            
+            # Add dragonfly_key and side if provided
+            if dragonfly_key:
+                cmd.extend(["--dragonfly-key", dragonfly_key])
+            if side:
+                cmd.extend(["--side", side])
+            
             print("Starting:", " ".join(cmd))
             if args.detach:
                 # Start in a new session so children survive if this launcher exits
@@ -194,8 +220,8 @@ def main() -> int:
         if results:
             failed = [(cam, port, rc) for (cam, port), rc in results.items() if rc != 0]
             if failed:
-                for cam_name, port, rc in failed:
-                    print(f"Command failed for {cam_name} on port {port} with exit code {rc}", file=sys.stderr)
+                # for cam_name, port, rc in failed:
+                #     print(f"Command failed for {cam_name} on port {port} with exit code {rc}", file=sys.stderr)
                 return 1
 
         return 0
@@ -245,13 +271,15 @@ def main() -> int:
                         continue
                     frame_id = data.get("frame_id", "")
                     ball_id = data.get("ball_id", "default")
+                    dragonfly_key = data.get("dragonfly_key", data.get("dragonflykey", ""))
+                    side = data.get("side", "")
                     try:
-                        num = parse_frame_number_from_id(frame_id)
+                        num, digits_str, scheme, _ = parse_frame_info(frame_id)
                     except ValueError as e:
                         print(f"[zmq-sub] ERROR: {e}")
                         continue
-                    suffix = f"{num:09d}"
-                    print(f"[zmq-sub] launching senders start-after suffix={suffix}, ball_id={ball_id}")
+                    suffix = digits_str  # preserve zero-padding width from source
+                    print(f"[zmq-sub] launching senders start-after suffix={suffix}, ball_id={ball_id}, scheme={scheme}, dragonfly_key={dragonfly_key}, side={side}")
                     # Forward to others if enabled
                     if pub_socket is not None:
                         try:
@@ -263,11 +291,12 @@ def main() -> int:
                             print("[forward] published trigger to subscribers")
                         except Exception as fe:
                             print(f"[forward] publish error: {fe}")
-                    rc = launch_senders_with_suffix(suffix, ball_id)
+                    rc = launch_senders_with_suffix(suffix, ball_id, scheme, dragonfly_key, side)
                     if rc == 0:
                         print(f"[zmq-sub] SUCCESS: launched with start-after={suffix}, ball_id={ball_id}")
                     else:
-                        print(f"[zmq-sub] ERROR: one or more senders failed (rc={rc})")
+                        pass
+                        # print(f"[zmq-sub] ERROR: one or more senders failed (rc={rc})")
                 except KeyboardInterrupt:
                     break
                 except Exception as e:

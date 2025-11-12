@@ -1,14 +1,50 @@
 #!/usr/bin/env python3
-import argparse, fnmatch, os, queue, socket, struct, threading, time, sys, json, re
-from typing import List, Tuple, Optional
+import argparse, fnmatch, os, queue, socket, struct, threading, time, sys, json, re, logging
+from typing import List, Tuple, Optional, Dict, Any
+from datetime import datetime
+try:
+    import zmq
+    ZMQ_AVAILABLE = True
+except ImportError:
+    ZMQ_AVAILABLE = False
 
 # inotify removed; using polling only
 
 CHUNK = 1 << 20  # 1 MiB
 
+# ---------- logging setup ----------
+
+def setup_logging(log_file: Optional[str] = None):
+    """Setup logging to both file and console."""
+    if log_file is None:
+        log_file = os.path.join("logs", f"sender_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    
+    # Create logs directory if it doesn't exist
+    log_dir = os.path.dirname(log_file) if os.path.dirname(log_file) else "."
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_file, mode='a'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return log_file
+
 # ---------- filename helpers ----------
 
 _digit_re = re.compile(r'(.*?)(\d+)(\.[^.]+)?$')
+
+# Specific patterns to capture frame index when it's not the final numeric group
+# 1) frame_camera09_000000000.jpg  -> capture 000000000
+_pat_frame_after_camera = re.compile(r'^(.*?_camera\d+_)(\d+)(\.[^.]+)$')
+# 2) frame_000000_camera01.jpg -> capture 000000
+_pat_frame_before_camera = re.compile(r'^(frame_)(\d+)((_camera\d+)(\.[^.]+))$')
 
 def split_numeric_suffix(name: str) -> Optional[Tuple[str, int, int, str]]:
     """
@@ -22,6 +58,29 @@ def split_numeric_suffix(name: str) -> Optional[Tuple[str, int, int, str]]:
     prefix, digits, ext = m.group(1), m.group(2), (m.group(3) or '')
     return prefix, int(digits), len(digits), ext
 
+def split_frame_number(name: str) -> Optional[Tuple[str, int, int, str]]:
+    """
+    Extract the frame number and allow reconstruction with:
+      prefix + zero_padded(num, width) + suffix
+
+    Supports:
+      - 'frame_camera09_000000000.jpg'  -> prefix='frame_camera09_', num=..., suffix='.jpg'
+      - 'frame_000000_camera01.jpg'     -> prefix='frame_', num=..., suffix='_camera01.jpg'
+    Falls back to trailing numeric group if above patterns do not match.
+    """
+    m = _pat_frame_after_camera.match(name)
+    if m:
+        prefix, digits, ext = m.group(1), m.group(2), m.group(3)
+        return prefix, int(digits), len(digits), ext
+
+    m = _pat_frame_before_camera.match(name)
+    if m:
+        prefix, digits, rest = m.group(1), m.group(2), m.group(3)
+        return prefix, int(digits), len(digits), rest
+
+    # Fallback: use trailing numeric suffix before extension
+    return split_numeric_suffix(name)
+
 def make_name(prefix: str, num: int, width: int, ext: str) -> str:
     return f"{prefix}{num:0{width}d}{ext}"
 
@@ -30,7 +89,7 @@ def lookahead_exists(src_dir: str, name: str, k: int) -> bool:
     If filename ends with a zero-padded integer, check if (number+k) file exists.
     Returns True if exists; False if not or unparsable.
     """
-    parts = split_numeric_suffix(name)
+    parts = split_frame_number(name)
     if not parts:
         return False
     prefix, num, width, ext = parts
@@ -55,7 +114,7 @@ def cleanup_stale_part_files(src_dir: str, pattern: str, max_age_seconds: int = 
         part_files = glob.glob(os.path.join(src_dir, part_pattern))
         
         if verbose and part_files:
-            print(f"[cleanup] Found {len(part_files)} .part files to check")
+            logging.debug(f"[cleanup] Found {len(part_files)} .part files to check")
         
         for part_file in part_files:
             try:
@@ -63,7 +122,7 @@ def cleanup_stale_part_files(src_dir: str, pattern: str, max_age_seconds: int = 
                 file_age = current_time - os.path.getmtime(part_file)
                 if file_age > max_age_seconds:
                     if verbose:
-                        print(f"[cleanup] Removing stale .part file: {os.path.basename(part_file)} (age: {file_age:.1f}s)")
+                        logging.info(f"[cleanup] Removing stale .part file: {os.path.basename(part_file)} (age: {file_age:.1f}s)")
                     os.remove(part_file)
                     cleaned_count += 1
             except (OSError, FileNotFoundError):
@@ -71,7 +130,7 @@ def cleanup_stale_part_files(src_dir: str, pattern: str, max_age_seconds: int = 
                 pass
                 
     except Exception as e:
-        print(f"[cleanup] Error during cleanup: {e}")
+        logging.error(f"[cleanup] Error during cleanup: {e}")
     
     return cleaned_count
 
@@ -107,7 +166,7 @@ def wait_for_file_and_check_complete(path: str, wait_ms: int = 5, passes: int = 
         # Check if we've exceeded the maximum wait time
         if time.time() - start_time > max_wait_time:
             if wait_ms > 0:  # Only warn if we were actually waiting
-                print(f"[WARNING] File {os.path.basename(path)} did not stabilize within {max_wait_time}s, considering it complete anyway")
+                logging.warning(f"[WARNING] File {os.path.basename(path)} did not stabilize within {max_wait_time}s, considering it complete anyway")
             return True
             
         time.sleep(max(0, wait_ms) / 1000.0)
@@ -156,9 +215,9 @@ def generate_dest_path(src_dir: str, rel_name: str, dest_path_prefix: str, prese
 
 # ---------- network send ----------
 
-def send_file(sock, src_path, rel_name, dest_path, verbose, counters):
+def send_file(sock, src_path, rel_name, dest_path, dragonfly_key, side, verbose, counters):
     size = os.path.getsize(src_path)
-    if verbose: print(f"[send] -> {rel_name} -> {dest_path} ({size} bytes)")
+    if verbose: logging.info(f"[send] -> {rel_name} -> {dest_path} ({size} bytes)")
     
     # Send filename
     name_b = rel_name.encode()
@@ -169,6 +228,16 @@ def send_file(sock, src_path, rel_name, dest_path, verbose, counters):
     dest_b = dest_path.encode()
     sock.sendall(struct.pack("!Q", len(dest_b)))
     sock.sendall(dest_b)
+    
+    # Send dragonfly_key
+    dragonfly_key_b = (dragonfly_key or "").encode()
+    sock.sendall(struct.pack("!Q", len(dragonfly_key_b)))
+    sock.sendall(dragonfly_key_b)
+    
+    # Send side
+    side_b = (side or "").encode()
+    sock.sendall(struct.pack("!Q", len(side_b)))
+    sock.sendall(side_b)
     
     # Send file size
     sock.sendall(struct.pack("!Q", size))
@@ -202,7 +271,7 @@ def send_file(sock, src_path, rel_name, dest_path, verbose, counters):
                 
                 if sent is None:
                     # Some platforms return None; fall back to manual send
-                    if verbose: print(f"[send] sendfile returned None, falling back to manual send for {rel_name}")
+                    if verbose: logging.debug(f"[send] sendfile returned None, falling back to manual send for {rel_name}")
                     f.seek(offset)
                     data = f.read(to_send)
                     if len(data) != to_send:
@@ -213,7 +282,7 @@ def send_file(sock, src_path, rel_name, dest_path, verbose, counters):
                     raise ConnectionError("sendfile returned 0 bytes - connection may be closed")
                 elif sent < to_send:
                     # Partial send - this is normal, continue with next chunk
-                    if verbose: print(f"[send] partial send for {rel_name}: {sent}/{to_send} bytes")
+                    if verbose: logging.debug(f"[send] partial send for {rel_name}: {sent}/{to_send} bytes")
                 
                 offset += sent
                 retry_count = 0  # Reset retry count on successful send
@@ -223,7 +292,7 @@ def send_file(sock, src_path, rel_name, dest_path, verbose, counters):
                 if retry_count > max_retries:
                     raise ConnectionError(f"Failed to send {rel_name} after {max_retries} retries: {e}")
                 
-                if verbose: print(f"[send] retry {retry_count}/{max_retries} for {rel_name} at offset {offset}: {e}")
+                if verbose: logging.warning(f"[send] retry {retry_count}/{max_retries} for {rel_name} at offset {offset}: {e}")
                 
                 # Fallback: finish with sendall to avoid repeated timeouts
                 f.seek(offset)
@@ -247,11 +316,11 @@ def send_file(sock, src_path, rel_name, dest_path, verbose, counters):
     ack = sock.recv(1)
     if not ack:
         raise ConnectionError("receiver closed without ACK")
-    if verbose: print(f"[send] ok {rel_name}")
+    if verbose: logging.debug(f"[send] ok {rel_name}")
     counters["files"] += 1
     counters["bytes"] += size
 
-def worker_thread(host: str, port: int, q: "queue.Queue[Tuple[str,str,str]]", tid: int, verbose: bool, counters: dict, error_queue: "queue.Queue[Tuple[str,str,str]]"):
+def worker_thread(host: str, port: int, q: "queue.Queue[Tuple[str,str,str]]", tid: int, verbose: bool, counters: dict, error_queue: "queue.Queue[Tuple[str,str,str]]", dragonfly_key: str, side: str):
     dest = (host, port); sock = None
     max_retries = 3
     
@@ -266,19 +335,19 @@ def worker_thread(host: str, port: int, q: "queue.Queue[Tuple[str,str,str]]", ti
         while retry_count <= max_retries and not success:
             try:
                 if sock is None:
-                    if verbose: print(f"[send] T{tid} connecting {dest}")
+                    if verbose: logging.info(f"[send] T{tid} connecting {dest}")
                     sock = socket.create_connection(dest, timeout=5)  # connect timeout only
                     sock.settimeout(None)                              # make I/O blocking (avoid sendfile timeouts)
                     try:
                         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     except Exception:
                         pass
-                send_file(sock, src_path, rel_name, dest_path, verbose, counters)
+                send_file(sock, src_path, rel_name, dest_path, dragonfly_key, side, verbose, counters)
                 success = True
                 
             except Exception as e:
                 retry_count += 1
-                if verbose: print(f"[send] T{tid} error (attempt {retry_count}/{max_retries + 1}): {e}", file=sys.stderr)
+                # logging.error(f"[send] T{tid} error (attempt {retry_count}/{max_retries + 1}): {e}")
                 
                 # Close the socket on any error
                 try:
@@ -293,7 +362,7 @@ def worker_thread(host: str, port: int, q: "queue.Queue[Tuple[str,str,str]]", ti
                     try:
                         error_queue.put((src_path, rel_name, error_msg), timeout=1)
                     except queue.Full:
-                        if verbose: print(f"[send] T{tid} error queue full, dropping error for {rel_name}", file=sys.stderr)
+                        logging.warning(f"[send] T{tid} error queue full, dropping error for {rel_name}")
                     break
                 else:
                     # Retry - reconnect
@@ -305,13 +374,13 @@ def worker_thread(host: str, port: int, q: "queue.Queue[Tuple[str,str,str]]", ti
                         except Exception:
                             pass
                     except Exception as conn_e:
-                        if verbose: print(f"[send] T{tid} reconnection failed: {conn_e}", file=sys.stderr)
+                        # logging.error(f"[send] T{tid} reconnection failed: {conn_e}")
                         if retry_count > max_retries:
                             error_msg = f"Failed to reconnect after {max_retries + 1} attempts: {conn_e}"
                             try:
                                 error_queue.put((src_path, rel_name, error_msg), timeout=1)
                             except queue.Full:
-                                if verbose: print(f"[send] T{tid} error queue full, dropping error for {rel_name}", file=sys.stderr)
+                                logging.warning(f"[send] T{tid} error queue full, dropping error for {rel_name}")
                             break
         
         q.task_done()
@@ -361,12 +430,21 @@ def main():
     # path handling
     ap.add_argument("--dest-path", default="", help="Destination path prefix for files on receiver (empty = use filename only)")
     ap.add_argument("--preserve-structure", action="store_true", help="Preserve source directory structure in destination path")
+    
+    # metadata
+    ap.add_argument("--dragonfly-key", default="", help="Dragonfly key to send with each file")
+    ap.add_argument("--side", default="", help="Side information to send with each file")
 
     # diagnostics
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--json-stats", action="store_true", help="Print stats in JSON on exit")
+    ap.add_argument("--log-file", default=None, help="Log file path (default: logs/sender_TIMESTAMP.log)")
 
     args = ap.parse_args()
+
+    # Setup logging
+    log_file = setup_logging(args.log_file)
+    logging.info(f"Logging to file: {log_file}")
 
     # inotify removed; no special handling
 
@@ -374,17 +452,17 @@ def main():
     if args.cleanup_part_files:
         cleaned = cleanup_stale_part_files(args.src_dir, args.pattern, args.part_file_max_age, args.verbose)
         if cleaned > 0:
-            print(f"[cleanup] Removed {cleaned} stale .part files")
+            logging.info(f"[cleanup] Removed {cleaned} stale .part files")
         elif args.verbose:
-            print(f"[cleanup] No stale .part files found")
+            logging.debug(f"[cleanup] No stale .part files found")
 
     if args.verbose:
-        print(f"[send] src={args.src_dir} host={args.host}:{args.port} conns={args.conns} pattern={args.pattern}")
-        print(f"[send] start-after='{args.start_after}', max_files={args.max_files or '∞'}, once={args.once}")
-        print(f"[send] lookahead={args.lookahead}, stable_ms={args.stable_ms}, stable_passes={args.stable_passes}")
-        print(f"[send] max_wait_seconds={args.max_wait_seconds}, file_wait_ms={args.file_wait_ms}, cleanup_part_files={args.cleanup_part_files}, cleanup_interval={args.cleanup_interval}s")
+        logging.info(f"[send] src={args.src_dir} host={args.host}:{args.port} conns={args.conns} pattern={args.pattern}")
+        logging.info(f"[send] start-after='{args.start_after}', max_files={args.max_files or '∞'}, once={args.once}")
+        logging.info(f"[send] lookahead={args.lookahead}, stable_ms={args.stable_ms}, stable_passes={args.stable_passes}")
+        logging.info(f"[send] max_wait_seconds={args.max_wait_seconds}, file_wait_ms={args.file_wait_ms}, cleanup_part_files={args.cleanup_part_files}, cleanup_interval={args.cleanup_interval}s")
         if args.dest_path:
-            print(f"[send] dest_path='{args.dest_path}', preserve_structure={args.preserve_structure}")
+            logging.info(f"[send] dest_path='{args.dest_path}', preserve_structure={args.preserve_structure}")
 
     q: "queue.Queue[Tuple[str,str,str]]" = queue.Queue(maxsize=max(1024, args.conns*128))
     error_q: "queue.Queue[Tuple[str,str,str]]" = queue.Queue()
@@ -396,7 +474,7 @@ def main():
     enqueued_files = 0
     t0 = time.time()
     for i in range(args.conns):
-        t = threading.Thread(target=worker_thread, args=(args.host, args.port, q, i, args.verbose, counters, error_q), daemon=True)
+        t = threading.Thread(target=worker_thread, args=(args.host, args.port, q, i, args.verbose, counters, error_q, args.dragonfly_key, args.side), daemon=True)
         t.start()
         threads.append(t)
 
@@ -415,7 +493,7 @@ def main():
             if not fast_ok:
                 if not wait_for_file_and_check_complete(full, args.stable_ms, args.stable_passes, args.max_wait_seconds, args.file_wait_ms):
                     if args.verbose:
-                        print(f"[WARNING] File {name} not ready, skipping")
+                        logging.warning(f"[WARNING] File {name} not ready, skipping")
                     continue
             dest_path = generate_dest_path(args.src_dir, name, args.dest_path, args.preserve_structure)
             q.put((full, name, dest_path))
@@ -428,7 +506,7 @@ def main():
         q.join()
     else:
         # Tail phase
-        if args.verbose: print("[send] entering tail phase")
+        if args.verbose: logging.info("[send] entering tail phase")
         # Polling tail
         last_cleanup_time = time.time()
         while not args.max_files or enqueued_files < args.max_files:
@@ -444,7 +522,7 @@ def main():
                     if not fast_ok:
                         if not wait_for_file_and_check_complete(full, args.stable_ms, args.stable_passes, args.max_wait_seconds, args.file_wait_ms):
                             if args.verbose:
-                                print(f"[WARNING] File {name} not ready, skipping")
+                                logging.warning(f"[WARNING] File {name} not ready, skipping")
                             continue
                     if not args.max_files or enqueued_files < args.max_files:
                         dest_path = generate_dest_path(args.src_dir, name, args.dest_path, args.preserve_structure)
@@ -458,7 +536,7 @@ def main():
                 if current_time - last_cleanup_time >= args.cleanup_interval:
                     cleaned = cleanup_stale_part_files(args.src_dir, args.pattern, args.part_file_max_age, args.verbose)
                     if cleaned > 0 and args.verbose:
-                        print(f"[cleanup] Periodic cleanup removed {cleaned} stale .part files")
+                        logging.info(f"[cleanup] Periodic cleanup removed {cleaned} stale .part files")
                     last_cleanup_time = current_time
             
             time.sleep(max(0, args.scan_ms) / 1000.0)
@@ -486,20 +564,20 @@ def main():
 
     # Report errors
     if errors:
-        print(f"[ERROR] {len(errors)} files failed to transfer:", file=sys.stderr)
-        for rel_name, error_msg in errors:
-            print(f"[ERROR] {rel_name}: {error_msg}", file=sys.stderr)
+        logging.error(f"[ERROR] {len(errors)} files failed to transfer:")
+        # for rel_name, error_msg in errors:
+        #     logging.error(f"[ERROR] {rel_name}: {error_msg}")
         if args.json_stats:
             print(json.dumps({"files": counters["files"], "bytes": counters["bytes"], "elapsed_s": elapsed, "MiB": mb, "MiB_per_s": mbps, "files_per_s": fps, "errors": len(errors), "error_files": [name for name, _ in errors]}))
         else:
-            print(f"[stats] files={counters['files']} bytes={counters['bytes']} elapsed={elapsed:.3f}s "
-                  f"MiB={mb:.2f} rate={mbps:.2f} MiB/s  files/s={fps:.1f} errors={len(errors)}")
+            logging.info(f"[stats] elapsed={elapsed:.3f}s "
+                  f"MiB={mb:.2f} rate={mbps:.2f} MiB/s  files/s={fps:.1f}")
         sys.exit(1)  # Exit with error code if any files failed
     else:
         if args.json_stats:
             print(json.dumps({"files": counters["files"], "bytes": counters["bytes"], "elapsed_s": elapsed, "MiB": mb, "MiB_per_s": mbps, "files_per_s": fps}))
         else:
-            print(f"[stats] files={counters['files']} bytes={counters['bytes']} elapsed={elapsed:.3f}s "
+            logging.info(f"[stats] elapsed={elapsed:.3f}s "
                   f"MiB={mb:.2f} rate={mbps:.2f} MiB/s  files/s={fps:.1f}")
 
 if __name__ == "__main__":
